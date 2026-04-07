@@ -9,7 +9,7 @@ fi
 
 
 
-if odin build . -o:speed -debug -out:$BUILD_DIR/$NAME && [[ $1 == "run" ]]; then
-# if odin build . -o:none -debug -out:$BUILD_DIR/$NAME && [[ $1 == "run" ]]; then
+# if odin build . -o:speed -debug -out:$BUILD_DIR/$NAME && [[ $1 == "run" ]]; then
+if odin build . -o:none -debug -out:$BUILD_DIR/$NAME && [[ $1 == "run" ]]; then
     $BUILD_DIR/$NAME
 fi

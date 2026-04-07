@@ -4,7 +4,9 @@ package main
 main :: proc() {
 	lane_count := 2 //os.get_processor_core_count()
 	g := new(G)
+	g.debugger_enabled = true
 	g.vga.framebuffer = make([]Pixel, VGA_WIDTH * VGA_HEIGHT)
+	g.busses = make(map[BusName]^Bus)
 	bootstrap_barrier: sync.Barrier
 	sync.barrier_init(&bootstrap_barrier, lane_count)
 
@@ -71,7 +73,6 @@ multithread_entry_point :: proc(tls_context: TLS) {
 		dt := now - last_frame
 		last_frame = now
 		if is_main_thread() {
-			fmt.printfln("dt main thread: %v", dt)
 			e: sdl3.Event
 			for sdl3.PollEvent(&e) {
 				#partial switch e.type {
@@ -167,33 +168,53 @@ multithread_entry_point :: proc(tls_context: TLS) {
 		lane_sync()
 
 		if is_main_thread() {
-			mctx := &g.microui_context
-			microui.begin(mctx)
-			microui.begin_window(mctx, "Debugger", microui.Rect{0, 0, 500, 400}, {.NO_CLOSE})
+			mu_ctx := &g.microui_context
+			microui.begin(mu_ctx)
+			microui.begin_window(mu_ctx, "Debugger", microui.Rect{0, 0, 600, 400}, {.NO_CLOSE})
+			frame_time_text := fmt.tprintf("Frame Time %vms", dt / 1000 / 1000)
+			microui.text(mu_ctx, frame_time_text)
 
-			b: strings.Builder
-			strings.builder_init(&b, context.temp_allocator)
-			for chip in g.chips {
-				fmt.sbprintf(&b, "%s -- ", chip.type)
-				for name, pin in chip.pins {
-					fmt.sbprintf(&b, "%s: %s,", name, pin.value)
+			if .ACTIVE in microui.begin_treenode(mu_ctx, "Chips") {
+				b: strings.Builder
+				strings.builder_init(&b, context.temp_allocator)
+				for chip in g.chips {
+					fmt.sbprintf(&b, "%s -- ", chip.type)
+					for name, pin in chip.pins {
+						fmt.sbprintf(&b, "%s: %s,", name, pin.value)
+					}
+					microui.layout_row(mu_ctx, {-1})
+					microui.text(mu_ctx, strings.to_string(b))
+					strings.builder_reset(&b)
+
 				}
-				microui.layout_row(mctx, {-1})
-				microui.text(mctx, strings.to_string(b))
-				strings.builder_reset(&b)
-
+				microui.end_treenode(mu_ctx)
 			}
-			microui.checkbox(mctx, "Enable Debugger", &g.debugger_enabled)
+			if .ACTIVE in microui.begin_treenode(mu_ctx, "Busses") {
+				b: strings.Builder
+				strings.builder_init(&b, context.temp_allocator)
+				for bus_name, bus in g.busses {
+					fmt.sbprintf(&b, "%s -- ", bus_name)
+					for pin in bus.pins {
+						fmt.sbprintf(&b, "%s: %s,", pin.name, pin.value)
+					}
+					microui.layout_row(mu_ctx, {-1})
+					microui.text(mu_ctx, strings.to_string(b))
+					strings.builder_reset(&b)
+
+				}
+				microui.end_treenode(mu_ctx)
+			}
+			microui.checkbox(mu_ctx, "Enable Debugger", &g.debugger_enabled)
 			opt := microui.Options{.ALIGN_CENTER}
 			if !g.debugger_enabled {
 				opt |= {.NO_INTERACT}
 			}
-			if .SUBMIT in microui.button(mctx, "Step", opt = opt) {
+			if .SUBMIT in microui.button(mu_ctx, "Step", opt = opt) {
 				tick_system_clock()
 			}
 
-			microui.end_window(mctx)
-			microui.end(mctx)
+			microui.end_window(mu_ctx)
+			microui.end(mu_ctx)
 
 		}
 		lane_sync()
@@ -249,7 +270,7 @@ multithread_entry_point :: proc(tls_context: TLS) {
 }
 tick_system_clock :: proc() {
 	g := tls.g
-	system_clock_pin := &g.system_clock.pins[.MHZ16]
+	system_clock_pin := g.system_clock.pins[.MHZ16]
 	system_clock_pin.value = .Hi if system_clock_pin.value == .Low else .Low
 	updated_pins: [dynamic]^Pin
 	updated_pins.allocator = context.temp_allocator
@@ -285,12 +306,6 @@ tick_system_clock :: proc() {
 
 on_rising_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 
-	update_pin :: proc(new_value: PinValue, pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
-		if new_value != pin.value {
-			pin.value = new_value
-			append(updated_pins, pin)
-		}
-	}
 
 	chip := pin.chip
 
@@ -299,39 +314,50 @@ on_rising_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 		//We only care about CP, Q0, Q1, and Q2 in this
 		//computer, so we don't need to consider any other pins
 		if pin.name == .CP {
-			chip.four_bit_counter_state += 1
-			chip.four_bit_counter_state &= 0xF
+			chip.fbcs_counter += 1
+			chip.fbcs_counter &= 0xF
 			output_pins :: [?]PinName{.Q0, .Q1, .Q2, .Q3}
 			for pin_name, i in output_pins {
-				output_pin := &chip.pins[pin_name]
+				output_pin := chip.pins[pin_name]
 				new_value: PinValue =
-					.Hi if (chip.four_bit_counter_state & (1 << cast(uint)i)) != 0 else .Low
+					.Hi if (chip.fbcs_counter & (1 << cast(uint)i)) != 0 else .Low
 				update_pin(new_value, output_pin, updated_pins)
 
 			}
 		}
+	case .EightBitShiftRegister:
+		if pin.name == .CP {
+			chip.ebsr_register <<= 1
+			if chip.pins[.nPE].value == .Low {
+				chip.ebsr_register = pins_to_u8({.D0, .D1, .D2, .D3, .D4, .D5, .D6, .D7}, chip)
+				q7 := chip.pins[.Q7]
+				q7.value = .Hi if (chip.ebsr_register & 0x80) != 0 else .Low
+			}
+			q7 := chip.pins[.Q7]
+			q7.value = .Hi if (chip.ebsr_register & 0x80) != 0 else .Low
+		}
+
 	case .NORGate:
-		a := &chip.pins[.A]
-		b := &chip.pins[.B]
-		y := &chip.pins[.Y]
+		a := chip.pins[.A]
+		b := chip.pins[.B]
+		y := chip.pins[.Y]
 		result := !(a.value == .Hi || b.value == .Hi)
 		new_value: PinValue = .Hi if result else .Low
 		update_pin(new_value, y, updated_pins)
 	case .ORGate:
-		a := &chip.pins[.A]
-		b := &chip.pins[.B]
-		y := &chip.pins[.Y]
+		a := chip.pins[.A]
+		b := chip.pins[.B]
+		y := chip.pins[.Y]
 		result := a.value == .Hi || b.value == .Hi
 		new_value: PinValue = .Hi if result else .Low
 		update_pin(new_value, y, updated_pins)
 	case .NANDGate:
-		a := &chip.pins[.A]
-		b := &chip.pins[.B]
-		y := &chip.pins[.Y]
+		a := chip.pins[.A]
+		b := chip.pins[.B]
+		y := chip.pins[.Y]
 		result := !(a.value == .Hi && b.value == .Hi)
 		new_value: PinValue = .Hi if result else .Low
 		update_pin(new_value, y, updated_pins)
-
 
 	case .SystemClock:
 	//System clock is handled directly in the main loop
@@ -341,49 +367,154 @@ on_rising_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 
 on_falling_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 	//TODO handle logic gates
+	chip := pin.chip
+	switch pin.chip.type {
+	case .ORGate:
+		a := chip.pins[.A]
+		b := chip.pins[.B]
+		y := chip.pins[.Y]
+		result := a.value == .Hi || b.value == .Hi
+		new_value: PinValue = .Hi if result else .Low
+		update_pin(new_value, y, updated_pins)
+	case .NORGate:
+		a := chip.pins[.A]
+		b := chip.pins[.B]
+		y := chip.pins[.Y]
+		result := !(a.value == .Hi || b.value == .Hi)
+		new_value: PinValue = .Hi if result else .Low
+		update_pin(new_value, y, updated_pins)
+	case .NANDGate:
+		a := chip.pins[.A]
+		b := chip.pins[.B]
+		y := chip.pins[.Y]
+		result := !(a.value == .Hi && b.value == .Hi)
+		new_value: PinValue = .Hi if result else .Low
+		update_pin(new_value, y, updated_pins)
+	case .SystemClock:
+	//System clock is handled directly in the main loop
+	case .FourBitCounter:
+	//only updates on rising edge
+	case .EightBitShiftRegister:
+		if pin.name == .nPE {
+			chip.ebsr_register = pins_to_u8({.D0, .D1, .D2, .D3, .D4, .D5, .D6, .D7}, chip)
+			q7 := chip.pins[.Q7]
+			q7.value = .Hi if (chip.ebsr_register & 0x80) != 0 else .Low
+		}
+	}
 
 }
 
+update_pin :: proc(new_value: PinValue, pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
+	if new_value != pin.value {
+		pin.value = new_value
+		append(updated_pins, pin)
+	}
+}
 
 build_the_computer :: proc() {
+
+	create_bus :: proc(name: BusName) -> ^Bus {
+		g := tls.g
+		result := new_clone(Bus{nil, name})
+		g.busses[name] = result
+		return result
+	}
+
 	g := tls.g
 	chips: [dynamic]Chip
 	//System clock
-	append(&chips, Chip{type = .SystemClock})
-	g.busses[.MHZ16] = Bus{nil, .MHZ16}
+	append(&chips, Chip{type = .SystemClock, pins = make(map[PinName]^Pin)})
+	MHZ16_bus := create_bus(.MHZ16)
 	g.system_clock = &chips[len(chips) - 1]
-	g.system_clock.pins[.MHZ16] = {g.system_clock, &g.busses[.MHZ16], .MHZ16, .Low}
-	system_clock_pin := &g.system_clock.pins[.MHZ16]
-	append(&system_clock_pin.bus.pins, &g.system_clock.pins[.MHZ16])
+	g.system_clock.pins[.MHZ16] = new_clone(Pin{g.system_clock, MHZ16_bus, .MHZ16, .Low})
+	system_clock_pin := g.system_clock.pins[.MHZ16]
 
 	//Four bit counter
-	g.busses[.MHZ8] = Bus{nil, .MHZ8}
-	g.busses[.MHZ4] = Bus{nil, .MHZ4}
-	g.busses[.MHZ2] = Bus{nil, .MHZ2}
-	append(&chips, Chip{})
+	MHZ8_bus := create_bus(.MHZ8)
+	MHZ4_bus := create_bus(.MHZ4)
+	MHZ2_bus := create_bus(.MHZ2)
+
+	append(&chips, Chip{pins = make(map[PinName]^Pin)})
 	four_bit_counter := &chips[len(chips) - 1]
 	four_bit_counter.type = .FourBitCounter
 	//All data pins are tied high, so counter starts off at 0xF
-	//(actually it should start at 0 and then jump to 0xF on the 2nd cycle, but this should be okay)
-	four_bit_counter.four_bit_counter_state = 0xF
+	//(actually it should start at 0 and then jump to 0xF on the 2nd cycle, but this should be okay, hopefully...)
+	four_bit_counter.fbcs_counter = 0xF
 	four_bit_counter.pins = {
-		.CP = {four_bit_counter, &g.busses[.MHZ16], .CP, system_clock_pin.value},
-		.Q0 = {four_bit_counter, &g.busses[.MHZ8], .Q0, .Hi},
-		.Q1 = {four_bit_counter, &g.busses[.MHZ4], .Q1, .Hi},
-		.Q2 = {four_bit_counter, &g.busses[.MHZ2], .Q2, .Hi},
-		.Q3 = {four_bit_counter, nil, .Q3, .Hi}, //Q3 is not connected to anything, but here consistency
+		.CP = new_clone(Pin{four_bit_counter, MHZ16_bus, .CP, system_clock_pin.value}),
+		.Q0 = new_clone(Pin{four_bit_counter, MHZ8_bus, .Q0, .Hi}),
+		.Q1 = new_clone(Pin{four_bit_counter, MHZ4_bus, .Q1, .Hi}),
+		.Q2 = new_clone(Pin{four_bit_counter, MHZ2_bus, .Q2, .Hi}),
+		.Q3 = new_clone(Pin{four_bit_counter, nil, .Q3, .Hi}), //Q3 is not connected to anything, but here consistency
 
 		//Don't care about any other pins on the four bit counter since theyre all tied high
 	}
-	for _, &pin in four_bit_counter.pins {
-		if pin.bus != nil {
-			append(&pin.bus.pins, &pin)
-		}
+	//nVREG_OE NOR gate
+	nVREG_OE_bus := create_bus(.nVREG_OE)
+	append(&chips, Chip{pins = make(map[PinName]^Pin)})
+	nVREG_OE_NOR_gate := &chips[len(chips) - 1]
+	nVREG_OE_NOR_gate.type = .NORGate
+	nVREG_OE_NOR_gate.pins = {
+		.A = new_clone(Pin{nVREG_OE_NOR_gate, MHZ4_bus, .A, .Low}),
+		.B = new_clone(Pin{nVREG_OE_NOR_gate, MHZ2_bus, .B, .Low}),
+		.Y = new_clone(Pin{nVREG_OE_NOR_gate, nVREG_OE_bus, .Y, .Hi}),
+	}
+
+	//nVGA_GET NAND gate
+	nVREG_GET_bus := create_bus(.nVGA_GET)
+	append(&chips, Chip{pins = make(map[PinName]^Pin)})
+	nVREG_GET_NAND_gate := &chips[len(chips) - 1]
+	nVREG_GET_NAND_gate.type = .NANDGate
+	nVREG_GET_NAND_gate.pins = {
+		.A = new_clone(Pin{nVREG_GET_NAND_gate, MHZ8_bus, .A, .Low}),
+		.B = new_clone(Pin{nVREG_GET_NAND_gate, nVREG_OE_bus, .B, .Low}),
+		.Y = new_clone(Pin{nVREG_GET_NAND_gate, nVREG_GET_bus, .Y, .Hi}),
+	}
+
+	//8-bit shift register for VGA output
+	vga_rgb_bus := create_bus(.VGA_RGB)
+	append(&chips, Chip{pins = make(map[PinName]^Pin)})
+	vga_shift_register := &chips[len(chips) - 1]
+	vga_shift_register.type = .EightBitShiftRegister
+
+	vga_shift_register.pins = {
+		//TODO D0-D7 should be conntect to VRAM, but we will hard code a checker-board pattern (00110011) for now
+		.D0  = new_clone(Pin{vga_shift_register, nil, .D0, .Low}),
+		.D1  = new_clone(Pin{vga_shift_register, nil, .D1, .Low}),
+		.D2  = new_clone(Pin{vga_shift_register, nil, .D2, .Hi}),
+		.D3  = new_clone(Pin{vga_shift_register, nil, .D3, .Hi}),
+		.D4  = new_clone(Pin{vga_shift_register, nil, .D4, .Low}),
+		.D5  = new_clone(Pin{vga_shift_register, nil, .D5, .Low}),
+		.D6  = new_clone(Pin{vga_shift_register, nil, .D6, .Hi}),
+		.D7  = new_clone(Pin{vga_shift_register, nil, .D7, .Hi}),
+		.CP  = new_clone(Pin{vga_shift_register, MHZ16_bus, .CP, .Low}),
+		.nPE = new_clone(Pin{vga_shift_register, nVREG_GET_bus, .nPE, .Low}),
+		.Q7  = new_clone(Pin{vga_shift_register, vga_rgb_bus, .Q7, .Low}), //controls the actual pixel color
 	}
 
 	//TODO build rest of chips
 
+
 	g.chips = chips[:]
+	for chip in chips {
+		for _, &pin in chip.pins {
+			if pin.bus != nil {
+				append(&pin.bus.pins, pin)
+			}
+		}
+	}
+
+}
+
+pins_to_u8 :: proc(pin_names: [8]PinName, chip: ^Chip) -> u8 {
+	result: u8
+	for pin_name, index in pin_names {
+		pin := chip.pins[pin_name]
+		if pin.value == .Hi {
+			result |= 1 << auto_cast index
+		}
+	}
+	return result
 }
 
 render_text :: proc(font: microui.Font, text: string, x, y: i32, color: microui.Color) {
@@ -527,7 +658,7 @@ G :: struct {
 	},
 	system_clock:     ^Chip,
 	chips:            []Chip,
-	busses:           map[BusName]Bus,
+	busses:           map[BusName]^Bus,
 	debugger_enabled: bool,
 
 	//platform
@@ -554,15 +685,23 @@ PinName :: enum {
 	D1,
 	D2,
 	D3,
-	nPE,
+	D4,
+	D5,
+	D6,
+	D7,
+	nPE, //parallel load enable (active low)
 	CEP,
 	CET,
-	CP,
+	CP, //Clock pulse
 	nMR,
 	Q0,
 	Q1,
 	Q2,
 	Q3,
+	Q4,
+	Q5,
+	Q6,
+	Q7,
 	TC,
 
 	//logic gates
@@ -585,19 +724,24 @@ BusName :: enum {
 	MHZ2,
 	nVGA_GET,
 	nVREG_OE,
+	VGA_RGB,
 }
 Chip :: struct {
-	type:                   enum {
+	type:          enum {
 		SystemClock,
 		FourBitCounter, //SN74HC161
+		EightBitShiftRegister, ////SN74HC166
 		NORGate,
 		ORGate,
 		NANDGate,
 	},
-	pins:                   map[PinName]Pin,
+	pins:          map[PinName]^Pin,
 
 	//FourBitCounter
-	four_bit_counter_state: int,
+	fbcs_counter:  int,
+
+	//EightBitShiftRegister
+	ebsr_register: u8,
 }
 TLS :: struct {
 	g:          ^G,
