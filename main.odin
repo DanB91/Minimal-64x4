@@ -2,10 +2,10 @@
 package main
 
 main :: proc() {
+	context.logger = log.create_console_logger(.Info)
 	lane_count := 2 //os.get_processor_core_count()
 	g := new(G)
-	g.debugger_enabled = true
-	g.vga.framebuffer = make([]Pixel, VGA_WIDTH * VGA_HEIGHT)
+	// g.debugger_enabled = true
 	g.busses = make(map[BusName]^Bus)
 	bootstrap_barrier: sync.Barrier
 	sync.barrier_init(&bootstrap_barrier, lane_count)
@@ -23,6 +23,7 @@ main :: proc() {
 			temp_tls,
 			multithread_entry_point,
 			self_cleanup = true,
+			init_context = context,
 		)
 	}
 
@@ -137,8 +138,9 @@ multithread_entry_point :: proc(tls_context: TLS) {
 			}
 
 		}
+		lane_sync()
 		if is_simulator_thread() && !g.debugger_enabled {
-			fmt.printfln("dt: %v", dt)
+			log.infof("dt: %v", dt)
 
 			TARGET_FRAME_TIME :: 16_666_666
 			SYSTEM_CLOCK_TICK_TIME_NS :: 1_000_000_000 / 16_000_000
@@ -148,9 +150,10 @@ multithread_entry_point :: proc(tls_context: TLS) {
 			//update system
 			assert(sdl3.GetCurrentTime(&now))
 
-			for total_time := 0; total_time < TARGET_FRAME_TIME; total_time += VGA_TICK_TIME_NS {
+			tick_time := 0
+			for !g.frame_complete {
 				if next_vga_tick <= 0 {
-					//TODO: tick VGA
+					tick_vga_clock()
 					next_vga_tick += VGA_TICK_TIME_NS
 				}
 				if next_system_tick <= 0 {
@@ -159,10 +162,12 @@ multithread_entry_point :: proc(tls_context: TLS) {
 				}
 				next_vga_tick -= VGA_TICK_TIME_NS
 				next_system_tick -= VGA_TICK_TIME_NS
+				tick_time += SYSTEM_CLOCK_TICK_TIME_NS
 			}
+			g.frame_complete = false
 			tmp := now
 			assert(sdl3.GetCurrentTime(&now))
-			fmt.printfln("time taken: %vns", now - tmp)
+			log.infof("time taken: %vns", now - tmp)
 
 		}
 		lane_sync()
@@ -217,20 +222,17 @@ multithread_entry_point :: proc(tls_context: TLS) {
 			microui.end(mu_ctx)
 
 		}
-		lane_sync()
 
 		if is_main_thread() {
-
 			viewport := sdl3.Rect{144, 35, SCREEN_WIDTH, SCREEN_HEIGHT}
 			viewport_f := sdl3.FRect{144, 35, SCREEN_WIDTH, SCREEN_HEIGHT}
-
 			sdl3.RenderClear(g.renderer)
 
 			raw_pixels: [^]Pixel
 			pitch: c.int
 			assert(sdl3.LockTexture(g.texture, &viewport, auto_cast &raw_pixels, &pitch))
 			pixels := raw_pixels[0:(pitch / 4) * SCREEN_HEIGHT]
-			copy(pixels, g.vga.framebuffer)
+			copy(pixels, g.vga_display.vga_pixels)
 			sdl3.UnlockTexture(g.texture)
 
 			sdl3.RenderTexture(g.renderer, g.texture, &viewport_f, nil)
@@ -268,10 +270,15 @@ multithread_entry_point :: proc(tls_context: TLS) {
 		}
 	}
 }
+tick_vga_clock :: proc() {
+	g := tls.g
+	vga_clock_pin := g.vga_display.pins[.VGAClock]
+	on_rising_edge(vga_clock_pin, nil)
+}
 tick_system_clock :: proc() {
 	g := tls.g
 	system_clock_pin := g.system_clock.pins[.MHZ16]
-	system_clock_pin.value = .Hi if system_clock_pin.value == .Low else .Low
+	system_clock_pin.value = .Hi //if system_clock_pin.value == .Low else .Low
 	updated_pins: [dynamic]^Pin
 	updated_pins.allocator = context.temp_allocator
 
@@ -286,18 +293,19 @@ tick_system_clock :: proc() {
 				if pin == pin_being_updated {
 					continue
 				}
-				update_chip := pin.value != new_value
-				if update_chip {
-					pin.value = new_value
-					switch new_value {
-					case .Hi:
-						on_rising_edge(pin, &updated_pins)
-					case .Low:
-						on_falling_edge(pin, &updated_pins)
-					case .X:
-					//high impedence, do nothing
-					}
+				//TODO: dont think we need this because of how update_pin() works, but keep around just in case...
+				// update_chip := pin.value != new_value || bus_being_updated == system_clock_pin.bus
+				// if update_chip {
+				pin.value = new_value
+				switch new_value {
+				case .Hi:
+					on_rising_edge(pin, &updated_pins)
+				case .Low:
+					on_falling_edge(pin, &updated_pins)
+				case .X:
+				//high impedence, do nothing
 				}
+				// }
 			}
 		}
 	}
@@ -314,27 +322,54 @@ on_rising_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 		//We only care about CP, Q0, Q1, and Q2 in this
 		//computer, so we don't need to consider any other pins
 		if pin.name == .CP {
-			chip.fbcs_counter += 1
-			chip.fbcs_counter &= 0xF
-			output_pins :: [?]PinName{.Q0, .Q1, .Q2, .Q3}
-			for pin_name, i in output_pins {
-				output_pin := chip.pins[pin_name]
-				new_value: PinValue =
-					.Hi if (chip.fbcs_counter & (1 << cast(uint)i)) != 0 else .Low
-				update_pin(new_value, output_pin, updated_pins)
-
-			}
+			chip.fbc_counter += 1
+			chip.fbc_counter &= 0xF
+			u4_to_pins(chip.fbc_counter, {.Q0, .Q1, .Q2, .Q3}, updated_pins, chip)
 		}
+	case .SixteenBitCounter:
+		if pin.name == .CPC {
+			chip.sbc_counter += 1
+			if chip.pins[.nMRC].value == .Low {
+				chip.sbc_counter = 0
+			}
+
+			u16_to_pins(
+				chip.sbc_counter,
+				{
+					.Q0,
+					.Q1,
+					.Q2,
+					.Q3,
+					.Q4,
+					.Q5,
+					.Q6,
+					.Q7,
+					.Q8,
+					.Q9,
+					.Q10,
+					.Q11,
+					.Q12,
+					.Q13,
+					.Q14,
+					.Q15,
+				},
+				updated_pins,
+				chip,
+			)
+		}
+
+
 	case .EightBitShiftRegister:
 		if pin.name == .CP {
 			chip.ebsr_register <<= 1
 			if chip.pins[.nPE].value == .Low {
 				chip.ebsr_register = pins_to_u8({.D0, .D1, .D2, .D3, .D4, .D5, .D6, .D7}, chip)
-				q7 := chip.pins[.Q7]
-				q7.value = .Hi if (chip.ebsr_register & 0x80) != 0 else .Low
 			}
-			q7 := chip.pins[.Q7]
-			q7.value = .Hi if (chip.ebsr_register & 0x80) != 0 else .Low
+			update_pin(
+				.Hi if (chip.ebsr_register & 0x80) != 0 else .Low,
+				chip.pins[.Q7],
+				updated_pins,
+			)
 		}
 
 	case .NORGate:
@@ -351,6 +386,14 @@ on_rising_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 		result := a.value == .Hi || b.value == .Hi
 		new_value: PinValue = .Hi if result else .Low
 		update_pin(new_value, y, updated_pins)
+	case .ORGate3Input:
+		a := chip.pins[.A]
+		b := chip.pins[.B]
+		c := chip.pins[.C]
+		y := chip.pins[.Y]
+		result := a.value == .Hi || b.value == .Hi || c.value == .Hi
+		new_value: PinValue = .Hi if result else .Low
+		update_pin(new_value, y, updated_pins)
 	case .NANDGate:
 		a := chip.pins[.A]
 		b := chip.pins[.B]
@@ -359,8 +402,30 @@ on_rising_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 		new_value: PinValue = .Hi if result else .Low
 		update_pin(new_value, y, updated_pins)
 
+	case .VGADisplay:
+		if pin.name == .VGAClock {
+			nhsync := chip.pins[.nHSYNC]
+			nvsync := chip.pins[.nVSYNC]
+			if nhsync.value != .Low && nvsync.value != .Low {
+				if chip.vga_column < VGA_WIDTH {
+					chip.vga_column += 1
+				}
+				rgb_pin := chip.pins[.RGB]
+				color_value: u32 = 0xFFFF_FFFF if rgb_pin.value == .Hi else 0
+				log.debugf(
+					"x: %v, y: %v, Color %X, Shift register state: %X",
+					chip.vga_column,
+					chip.vga_row,
+					color_value,
+					rgb_pin.bus.pins[0].chip.ebsr_register,
+				)
+				chip.vga_pixels[chip.vga_row * VGA_WIDTH + chip.vga_column] = color_value
+			}
+		}
 	case .SystemClock:
 	//System clock is handled directly in the main loop
+	case .FlipFlop:
+	//Flip Flop is only affected by low signals
 
 	}
 }
@@ -368,6 +433,7 @@ on_rising_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 on_falling_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 	//TODO handle logic gates
 	chip := pin.chip
+	g := tls.g
 	switch pin.chip.type {
 	case .ORGate:
 		a := chip.pins[.A]
@@ -383,6 +449,14 @@ on_falling_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 		result := !(a.value == .Hi || b.value == .Hi)
 		new_value: PinValue = .Hi if result else .Low
 		update_pin(new_value, y, updated_pins)
+	case .ORGate3Input:
+		a := chip.pins[.A]
+		b := chip.pins[.B]
+		c := chip.pins[.C]
+		y := chip.pins[.Y]
+		result := a.value == .Hi || b.value == .Hi || c.value == .Hi
+		new_value: PinValue = .Hi if result else .Low
+		update_pin(new_value, y, updated_pins)
 	case .NANDGate:
 		a := chip.pins[.A]
 		b := chip.pins[.B]
@@ -390,15 +464,31 @@ on_falling_edge :: proc(pin: ^Pin, updated_pins: ^[dynamic]^Pin) {
 		result := !(a.value == .Hi && b.value == .Hi)
 		new_value: PinValue = .Hi if result else .Low
 		update_pin(new_value, y, updated_pins)
+	case .FlipFlop:
+		ns := chip.pins[.nS]
+		nr := chip.pins[.nR]
+		q := chip.pins[.Q]
+
+		if pin.name == .nS {
+			update_pin(.Hi, q, updated_pins)
+		} else if pin.name == .nR {
+			update_pin(.Low, q, updated_pins)
+		}
+
 	case .SystemClock:
 	//System clock is handled directly in the main loop
-	case .FourBitCounter:
 	//only updates on rising edge
+	case .FourBitCounter:
+	case .SixteenBitCounter:
 	case .EightBitShiftRegister:
-		if pin.name == .nPE {
-			chip.ebsr_register = pins_to_u8({.D0, .D1, .D2, .D3, .D4, .D5, .D6, .D7}, chip)
-			q7 := chip.pins[.Q7]
-			q7.value = .Hi if (chip.ebsr_register & 0x80) != 0 else .Low
+	case .VGADisplay:
+		if pin.name == .nHSYNC {
+			chip.vga_column = 0
+			chip.vga_row += 1
+		} else if pin.name == .nVSYNC {
+			chip.vga_column = 0
+			chip.vga_row = 0
+			g.frame_complete = true
 		}
 	}
 
@@ -421,75 +511,196 @@ build_the_computer :: proc() {
 	}
 
 	g := tls.g
-	chips: [dynamic]Chip
+	chips: [dynamic]^Chip
 	//System clock
-	append(&chips, Chip{type = .SystemClock, pins = make(map[PinName]^Pin)})
 	MHZ16_bus := create_bus(.MHZ16)
-	g.system_clock = &chips[len(chips) - 1]
-	g.system_clock.pins[.MHZ16] = new_clone(Pin{g.system_clock, MHZ16_bus, .MHZ16, .Low})
-	system_clock_pin := g.system_clock.pins[.MHZ16]
+	system_clock_pin: ^Pin
+	{
+		g.system_clock = new_clone(Chip{type = .SystemClock, pins = make(map[PinName]^Pin)})
+		g.system_clock.pins[.MHZ16] = new_clone(Pin{g.system_clock, MHZ16_bus, .MHZ16, .Low})
+		system_clock_pin = g.system_clock.pins[.MHZ16]
+		append(&chips, g.system_clock)
+	}
 
 	//Four bit counter
 	MHZ8_bus := create_bus(.MHZ8)
 	MHZ4_bus := create_bus(.MHZ4)
 	MHZ2_bus := create_bus(.MHZ2)
 
-	append(&chips, Chip{pins = make(map[PinName]^Pin)})
-	four_bit_counter := &chips[len(chips) - 1]
-	four_bit_counter.type = .FourBitCounter
-	//All data pins are tied high, so counter starts off at 0xF
-	//(actually it should start at 0 and then jump to 0xF on the 2nd cycle, but this should be okay, hopefully...)
-	four_bit_counter.fbcs_counter = 0xF
-	four_bit_counter.pins = {
-		.CP = new_clone(Pin{four_bit_counter, MHZ16_bus, .CP, system_clock_pin.value}),
-		.Q0 = new_clone(Pin{four_bit_counter, MHZ8_bus, .Q0, .Hi}),
-		.Q1 = new_clone(Pin{four_bit_counter, MHZ4_bus, .Q1, .Hi}),
-		.Q2 = new_clone(Pin{four_bit_counter, MHZ2_bus, .Q2, .Hi}),
-		.Q3 = new_clone(Pin{four_bit_counter, nil, .Q3, .Hi}), //Q3 is not connected to anything, but here consistency
+	{
+		four_bit_counter := new_clone(Chip{pins = make(map[PinName]^Pin)})
+		append(&chips, four_bit_counter)
+		four_bit_counter.type = .FourBitCounter
+		//All data pins are tied high, so counter starts off at 0xF
+		//(actually it should start at 0 and then jump to 0xF on the 2nd cycle, but this should be okay, hopefully...)
+		four_bit_counter.fbc_counter = 0xF
+		four_bit_counter.pins = {
+			.CP = new_clone(Pin{four_bit_counter, MHZ16_bus, .CP, system_clock_pin.value}),
+			.Q0 = new_clone(Pin{four_bit_counter, MHZ8_bus, .Q0, .Hi}),
+			.Q1 = new_clone(Pin{four_bit_counter, MHZ4_bus, .Q1, .Hi}),
+			.Q2 = new_clone(Pin{four_bit_counter, MHZ2_bus, .Q2, .Hi}),
+			.Q3 = new_clone(Pin{four_bit_counter, nil, .Q3, .Hi}), //Q3 is not connected to anything, but here consistency
 
-		//Don't care about any other pins on the four bit counter since theyre all tied high
+			//Don't care about any other pins on the four bit counter since theyre all tied high
+		}
 	}
 	//nVREG_OE NOR gate
 	nVREG_OE_bus := create_bus(.nVREG_OE)
-	append(&chips, Chip{pins = make(map[PinName]^Pin)})
-	nVREG_OE_NOR_gate := &chips[len(chips) - 1]
-	nVREG_OE_NOR_gate.type = .NORGate
-	nVREG_OE_NOR_gate.pins = {
-		.A = new_clone(Pin{nVREG_OE_NOR_gate, MHZ4_bus, .A, .Low}),
-		.B = new_clone(Pin{nVREG_OE_NOR_gate, MHZ2_bus, .B, .Low}),
-		.Y = new_clone(Pin{nVREG_OE_NOR_gate, nVREG_OE_bus, .Y, .Hi}),
+	{
+		nVREG_OE_NOR_gate := new_clone(Chip{pins = make(map[PinName]^Pin)})
+		append(&chips, nVREG_OE_NOR_gate)
+		nVREG_OE_NOR_gate.type = .NORGate
+		nVREG_OE_NOR_gate.pins = {
+			.A = new_clone(Pin{nVREG_OE_NOR_gate, MHZ4_bus, .A, .Low}),
+			.B = new_clone(Pin{nVREG_OE_NOR_gate, MHZ2_bus, .B, .Low}),
+			.Y = new_clone(Pin{nVREG_OE_NOR_gate, nVREG_OE_bus, .Y, .Hi}),
+		}
 	}
 
 	//nVGA_GET NAND gate
 	nVREG_GET_bus := create_bus(.nVGA_GET)
-	append(&chips, Chip{pins = make(map[PinName]^Pin)})
-	nVREG_GET_NAND_gate := &chips[len(chips) - 1]
-	nVREG_GET_NAND_gate.type = .NANDGate
-	nVREG_GET_NAND_gate.pins = {
-		.A = new_clone(Pin{nVREG_GET_NAND_gate, MHZ8_bus, .A, .Low}),
-		.B = new_clone(Pin{nVREG_GET_NAND_gate, nVREG_OE_bus, .B, .Low}),
-		.Y = new_clone(Pin{nVREG_GET_NAND_gate, nVREG_GET_bus, .Y, .Hi}),
+	{
+		nVREG_GET_NAND_gate := new_clone(Chip{pins = make(map[PinName]^Pin)})
+		append(&chips, nVREG_GET_NAND_gate)
+		nVREG_GET_NAND_gate.type = .NANDGate
+		nVREG_GET_NAND_gate.pins = {
+			.A = new_clone(Pin{nVREG_GET_NAND_gate, MHZ8_bus, .A, .Low}),
+			.B = new_clone(Pin{nVREG_GET_NAND_gate, nVREG_OE_bus, .B, .Low}),
+			.Y = new_clone(Pin{nVREG_GET_NAND_gate, nVREG_GET_bus, .Y, .Hi}),
+		}
 	}
 
 	//8-bit shift register for VGA output
 	vga_rgb_bus := create_bus(.VGA_RGB)
-	append(&chips, Chip{pins = make(map[PinName]^Pin)})
-	vga_shift_register := &chips[len(chips) - 1]
-	vga_shift_register.type = .EightBitShiftRegister
+	{
+		vga_shift_register := new_clone(Chip{pins = make(map[PinName]^Pin)})
+		append(&chips, vga_shift_register)
+		vga_shift_register.type = .EightBitShiftRegister
 
-	vga_shift_register.pins = {
-		//TODO D0-D7 should be conntect to VRAM, but we will hard code a checker-board pattern (00110011) for now
-		.D0  = new_clone(Pin{vga_shift_register, nil, .D0, .Low}),
-		.D1  = new_clone(Pin{vga_shift_register, nil, .D1, .Low}),
-		.D2  = new_clone(Pin{vga_shift_register, nil, .D2, .Hi}),
-		.D3  = new_clone(Pin{vga_shift_register, nil, .D3, .Hi}),
-		.D4  = new_clone(Pin{vga_shift_register, nil, .D4, .Low}),
-		.D5  = new_clone(Pin{vga_shift_register, nil, .D5, .Low}),
-		.D6  = new_clone(Pin{vga_shift_register, nil, .D6, .Hi}),
-		.D7  = new_clone(Pin{vga_shift_register, nil, .D7, .Hi}),
-		.CP  = new_clone(Pin{vga_shift_register, MHZ16_bus, .CP, .Low}),
-		.nPE = new_clone(Pin{vga_shift_register, nVREG_GET_bus, .nPE, .Low}),
-		.Q7  = new_clone(Pin{vga_shift_register, vga_rgb_bus, .Q7, .Low}), //controls the actual pixel color
+		vga_shift_register.pins = {
+			//TODO D0-D7 should be conntect to VRAM, but we will hard code a checker-board pattern (00110011) for now
+			.D0  = new_clone(Pin{vga_shift_register, nil, .D0, .Low}),
+			.D1  = new_clone(Pin{vga_shift_register, nil, .D1, .Low}),
+			.D2  = new_clone(Pin{vga_shift_register, nil, .D2, .Hi}),
+			.D3  = new_clone(Pin{vga_shift_register, nil, .D3, .Hi}),
+			.D4  = new_clone(Pin{vga_shift_register, nil, .D4, .Low}),
+			.D5  = new_clone(Pin{vga_shift_register, nil, .D5, .Low}),
+			.D6  = new_clone(Pin{vga_shift_register, nil, .D6, .Hi}),
+			.D7  = new_clone(Pin{vga_shift_register, nil, .D7, .Hi}),
+			.CP  = new_clone(Pin{vga_shift_register, MHZ16_bus, .CP, .Low}),
+			.nPE = new_clone(Pin{vga_shift_register, nVREG_GET_bus, .nPE, .Low}),
+			.Q7  = new_clone(Pin{vga_shift_register, vga_rgb_bus, .Q7, .Low}), //controls the actual pixel color
+		}
+	}
+	//VGA sync counter
+
+	h1_bus := create_bus(.H1)
+	h2_bus := create_bus(.H2)
+	h4_bus := create_bus(.H4)
+	h8_bus := create_bus(.H8)
+	h16_bus := create_bus(.H16)
+	h32_bus := create_bus(.H32)
+	v1_bus := create_bus(.V1)
+	v2_bus := create_bus(.V2)
+	v4_bus := create_bus(.V4)
+	v8_bus := create_bus(.V8)
+	v16_bus := create_bus(.V16)
+	v32_bus := create_bus(.V32)
+	v64_bus := create_bus(.V64)
+	v128_bus := create_bus(.V128)
+	v256_bus := create_bus(.V256)
+
+	nMRC_bus := create_bus(.nMRC)
+	{
+		vga_sync_counter := new_clone(Chip{pins = make(map[PinName]^Pin)})
+		append(&chips, vga_sync_counter)
+		vga_sync_counter.type = .SixteenBitCounter
+		vga_sync_counter.pins = {
+			.Q0   = new_clone(Pin{vga_sync_counter, h1_bus, .Q0, .Low}),
+			.Q1   = new_clone(Pin{vga_sync_counter, h2_bus, .Q1, .Low}),
+			.Q2   = new_clone(Pin{vga_sync_counter, h4_bus, .Q2, .Low}),
+			.Q3   = new_clone(Pin{vga_sync_counter, h8_bus, .Q3, .Low}),
+			.Q4   = new_clone(Pin{vga_sync_counter, h16_bus, .Q4, .Low}),
+			.Q5   = new_clone(Pin{vga_sync_counter, h32_bus, .Q5, .Low}),
+			//Q6 not connected
+			.Q6   = new_clone(Pin{vga_sync_counter, nil, .Q6, .Low}),
+			.Q7   = new_clone(Pin{vga_sync_counter, v1_bus, .Q7, .Low}),
+			.Q8   = new_clone(Pin{vga_sync_counter, v2_bus, .Q8, .Low}),
+			.Q9   = new_clone(Pin{vga_sync_counter, v4_bus, .Q9, .Low}),
+			.Q10  = new_clone(Pin{vga_sync_counter, v8_bus, .Q10, .Low}),
+			.Q11  = new_clone(Pin{vga_sync_counter, v16_bus, .Q11, .Low}),
+			.Q12  = new_clone(Pin{vga_sync_counter, v32_bus, .Q12, .Low}),
+			.Q13  = new_clone(Pin{vga_sync_counter, v64_bus, .Q13, .Low}),
+			.Q14  = new_clone(Pin{vga_sync_counter, v128_bus, .Q14, .Low}),
+			.Q15  = new_clone(Pin{vga_sync_counter, v256_bus, .Q15, .Low}),
+			.CPC  = new_clone(Pin{vga_sync_counter, nVREG_GET_bus, .CPC, .Low}),
+			.nMRC = new_clone(Pin{vga_sync_counter, nMRC_bus, .nMRC, .Hi}),
+		}
+
+	}
+
+	hsync_bus := create_bus(.nHSYNC)
+	{
+		or_gate := new_clone(Chip{pins = make(map[PinName]^Pin)})
+		append(&chips, or_gate)
+		or_gate.type = .ORGate3Input
+		or_gate.pins = {
+			.A = new_clone(Pin{or_gate, h8_bus, .A, .Low}),
+			.B = new_clone(Pin{or_gate, h16_bus, .B, .Low}),
+			.C = new_clone(Pin{or_gate, h32_bus, .C, .Low}),
+			.Y = new_clone(Pin{or_gate, hsync_bus, .Y, .Low}),
+		}
+
+	}
+
+	{
+		nand_gate := new_clone(Chip{pins = make(map[PinName]^Pin)})
+		append(&chips, nand_gate)
+		nand_gate.type = .NANDGate
+		nand_gate.pins = {
+			.A = new_clone(Pin{nand_gate, v4_bus, .A, .Low}),
+			.B = new_clone(Pin{nand_gate, v256_bus, .B, .Low}),
+			.Y = new_clone(Pin{nand_gate, nMRC_bus, .Y, .Hi}),
+		}
+	}
+
+
+	vga_flip_flop_set_bus := create_bus(.VGAFlipFlopSet)
+	{
+		nand_gate := new_clone(Chip{pins = make(map[PinName]^Pin)})
+		append(&chips, nand_gate)
+		nand_gate.type = .NANDGate
+		nand_gate.pins = {
+			.A = new_clone(Pin{nand_gate, v1_bus, .A, .Low}),
+			.B = new_clone(Pin{nand_gate, nil, .B, .Hi}),
+			.Y = new_clone(Pin{nand_gate, vga_flip_flop_set_bus, .Y, .Hi}),
+		}
+	}
+
+	vsync_bus := create_bus(.nVSYNC)
+	{
+		flip_flop := new_clone(Chip{pins = make(map[PinName]^Pin)})
+		append(&chips, flip_flop)
+		flip_flop.type = .FlipFlop
+		flip_flop.pins = {
+			.nS = new_clone(Pin{flip_flop, vga_flip_flop_set_bus, .nS, .Hi}),
+			.nR = new_clone(Pin{flip_flop, nMRC_bus, .nR, .Hi}),
+			.Q  = new_clone(Pin{flip_flop, vsync_bus, .Q, .Low}),
+		}
+	}
+
+	{
+		g.vga_display = new_clone(Chip{pins = make(map[PinName]^Pin)})
+		append(&chips, g.vga_display)
+		g.vga_display.type = .VGADisplay
+		g.vga_display.pins = {
+			.RGB      = new_clone(Pin{g.vga_display, vga_rgb_bus, .RGB, .Low}),
+			.VGAClock = new_clone(Pin{g.vga_display, nil, .VGAClock, .Hi}),
+			.nHSYNC   = new_clone(Pin{g.vga_display, hsync_bus, .nHSYNC, .Low}),
+			.nVSYNC   = new_clone(Pin{g.vga_display, vsync_bus, .nVSYNC, .Low}),
+		}
+		g.vga_display.vga_pixels = make([]Pixel, VGA_WIDTH * VGA_HEIGHT)
+
 	}
 
 	//TODO build rest of chips
@@ -515,6 +726,39 @@ pins_to_u8 :: proc(pin_names: [8]PinName, chip: ^Chip) -> u8 {
 		}
 	}
 	return result
+}
+
+u8_to_pins :: proc(value: u8, pin_names: [8]PinName, updated_pins: ^[dynamic]^Pin, chip: ^Chip) {
+	for i in 0 ..< 8 {
+		update_pin(
+			.Hi if (value & (1 << auto_cast i)) != 0 else .Low,
+			chip.pins[pin_names[i]],
+			updated_pins,
+		)
+	}
+}
+u16_to_pins :: proc(
+	value: u16,
+	pin_names: [16]PinName,
+	updated_pins: ^[dynamic]^Pin,
+	chip: ^Chip,
+) {
+	for i in 0 ..< 16 {
+		update_pin(
+			.Hi if (value & (1 << auto_cast i)) != 0 else .Low,
+			chip.pins[pin_names[i]],
+			updated_pins,
+		)
+	}
+}
+u4_to_pins :: proc(value: u8, pin_names: [4]PinName, updated_pins: ^[dynamic]^Pin, chip: ^Chip) {
+	for i in 0 ..< 4 {
+		update_pin(
+			.Hi if (value & (1 << auto_cast i)) != 0 else .Low,
+			chip.pins[pin_names[i]],
+			updated_pins,
+		)
+	}
 }
 
 render_text :: proc(font: microui.Font, text: string, x, y: i32, color: microui.Color) {
@@ -648,18 +892,12 @@ tls: TLS
 
 G :: struct {
 	should_quit:      bool,
-	vga:              struct {
-		//inputs
-		color:        Pin, //Hi for white, Low for black
-		hsync, vsync: Pin,
-		pixel_clock:  sdl3.Time,
-		x, y:         int,
-		framebuffer:  []Pixel,
-	},
+	vga_display:      ^Chip,
 	system_clock:     ^Chip,
-	chips:            []Chip,
+	chips:            []^Chip,
 	busses:           map[BusName]^Bus,
 	debugger_enabled: bool,
+	frame_complete:   bool,
 
 	//platform
 	microui_context:  microui.Context,
@@ -680,6 +918,7 @@ PinValue :: enum {
 	Hi,
 }
 PinName :: enum {
+	//various ICs
 	MHZ16,
 	D0,
 	D1,
@@ -702,16 +941,33 @@ PinName :: enum {
 	Q5,
 	Q6,
 	Q7,
+	Q8,
+	Q9,
+	Q10,
+	Q11,
+	Q12,
+	Q13,
+	Q14,
+	Q15,
 	TC,
+	CPC,
+	nMRC,
+	nHSYNC,
+	nVSYNC,
+	VGAClock,
+	RGB,
+	VCC,
+	GND,
 
 	//logic gates
 	A,
 	B,
+	C,
 	Y,
-
-	//shared
-	VCC,
-	GND,
+	nS,
+	nR,
+	Q,
+	nQ,
 }
 Bus :: struct {
 	pins: [dynamic]^Pin,
@@ -725,23 +981,54 @@ BusName :: enum {
 	nVGA_GET,
 	nVREG_OE,
 	VGA_RGB,
+	nHSYNC,
+	nVSYNC,
+	H1,
+	H2,
+	H4,
+	H8,
+	H16,
+	H32,
+	V1,
+	V2,
+	V4,
+	V8,
+	V16,
+	V32,
+	V64,
+	V128,
+	V256,
+	nMRC,
+	VGAFlipFlopSet,
 }
 Chip :: struct {
 	type:          enum {
 		SystemClock,
 		FourBitCounter, //SN74HC161
+		SixteenBitCounter, ////2 SN74HC590s together
 		EightBitShiftRegister, ////SN74HC166
+		VGADisplay, //made up device to simulate a vga display
 		NORGate,
 		ORGate,
+		ORGate3Input, //made up
+		FlipFlop,
 		NANDGate,
 	},
 	pins:          map[PinName]^Pin,
 
 	//FourBitCounter
-	fbcs_counter:  int,
+	fbc_counter:   u8,
+
+	//SixteenBitCounter
+	sbc_counter:   u16,
 
 	//EightBitShiftRegister
 	ebsr_register: u8,
+
+	//VGA display
+	vga_row:       int,
+	vga_column:    int,
+	vga_pixels:    []Pixel,
 }
 TLS :: struct {
 	g:          ^G,
@@ -753,6 +1040,7 @@ TLS :: struct {
 
 import "core:c"
 import "core:fmt"
+import "core:log"
 import "core:strings"
 import "core:sync"
 import "core:thread"
